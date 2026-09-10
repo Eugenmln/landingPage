@@ -14,6 +14,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import React from "react";
 import { useEffect, useMemo, useState } from "react";
 import {
   deleteOutfit,
