@@ -23,6 +23,16 @@ export function usingCloudinary() {
 }
 
 export function buildUploadMiddleware(uploadDir) {
+  if (
+    process.env.NODE_ENV === "production" &&
+    !cloudinaryConfigured &&
+    !process.env.UPLOAD_DIR
+  ) {
+    throw new Error(
+      "Production image storage is not configured. Set Cloudinary credentials or UPLOAD_DIR on a persistent volume.",
+    );
+  }
+
   const storage = cloudinaryConfigured
     ? multer.memoryStorage()
     : multer.diskStorage({
