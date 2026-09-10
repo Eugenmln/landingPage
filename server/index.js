@@ -1,9 +1,10 @@
 import cors from "cors";
 import express from "express";
+import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
+import { timingSafeEqual, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
 import {
@@ -46,6 +47,14 @@ if (!usingCloudinary()) {
 }
 
 const upload = buildUploadMiddleware(uploadDir);
+const adminLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 60,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { message: "Demasiados intentos. Esperá unos minutos y volvé a intentar." },
+});
+
 const app = express();
 
 app.disable("x-powered-by");
@@ -87,14 +96,14 @@ app.get("/api/store", asyncHandler(async (_req, res) => {
   });
 }));
 
-app.post("/api/products", requireAdmin, asyncHandler(async (req, res) => {
+app.post("/api/products", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
   const product = normalizeProduct(req.body);
   validateProduct(product);
   const saved = await upsertProduct(product);
   res.status(201).json(saved);
 }));
 
-app.put("/api/products/:id", requireAdmin, asyncHandler(async (req, res) => {
+app.put("/api/products/:id", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
   if (!(await productExists(req.params.id))) {
     throw notFound("La prenda no existe.");
   }
@@ -104,7 +113,7 @@ app.put("/api/products/:id", requireAdmin, asyncHandler(async (req, res) => {
   res.json(saved);
 }));
 
-app.delete("/api/products/:id", requireAdmin, asyncHandler(async (req, res) => {
+app.delete("/api/products/:id", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
   const deleted = await removeProduct(req.params.id);
   if (!deleted) {
     throw notFound("La prenda no existe.");
@@ -112,7 +121,7 @@ app.delete("/api/products/:id", requireAdmin, asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.post("/api/outfits", requireAdmin, asyncHandler(async (req, res) => {
+app.post("/api/outfits", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
   const outfit = normalizeOutfit(req.body);
   validateOutfit(outfit);
   await validateOutfitProducts(outfit.productIds);
@@ -120,7 +129,7 @@ app.post("/api/outfits", requireAdmin, asyncHandler(async (req, res) => {
   res.status(201).json(saved);
 }));
 
-app.put("/api/outfits/:id", requireAdmin, asyncHandler(async (req, res) => {
+app.put("/api/outfits/:id", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
   if (!(await outfitExists(req.params.id))) {
     throw notFound("El outfit no existe.");
   }
@@ -131,7 +140,7 @@ app.put("/api/outfits/:id", requireAdmin, asyncHandler(async (req, res) => {
   res.json(saved);
 }));
 
-app.delete("/api/outfits/:id", requireAdmin, asyncHandler(async (req, res) => {
+app.delete("/api/outfits/:id", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
   const deleted = await removeOutfit(req.params.id);
   if (!deleted) {
     throw notFound("El outfit no existe.");
@@ -139,7 +148,7 @@ app.delete("/api/outfits/:id", requireAdmin, asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.put("/api/settings", requireAdmin, asyncHandler(async (req, res) => {
+app.put("/api/settings", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
   const current = await getStore();
   const settings = {
     phone: String(req.body.phone || current.settings.phone).replace(/[^\d]/g, ""),
@@ -158,7 +167,7 @@ app.put("/api/settings", requireAdmin, asyncHandler(async (req, res) => {
   res.json({ phone: saved.phone, instagram: saved.instagram });
 }));
 
-app.post("/api/uploads", requireAdmin, (req, res, next) => {
+app.post("/api/uploads", adminLimiter, requireAdmin, (req, res, next) => {
   upload.single("image")(req, res, async (error) => {
     if (error) {
       next(error);
@@ -176,6 +185,10 @@ app.post("/api/uploads", requireAdmin, (req, res, next) => {
       next(uploadError);
     }
   });
+});
+
+app.use("/api", (_req, res) => {
+  res.status(404).json({ message: "Endpoint no encontrado." });
 });
 
 app.use(express.static(path.join(root, "dist"), {
@@ -241,7 +254,7 @@ async function requireAdmin(req, res, next) {
     const expected = process.env.ADMIN_PIN || store.settings.adminPin;
     const supplied = req.header("x-admin-pin");
 
-    if (!supplied || supplied !== expected) {
+    if (!supplied || !safeSecretEqual(supplied, expected)) {
       return res.status(401).json({ message: "Clave de administrador incorrecta." });
     }
 
@@ -249,6 +262,12 @@ async function requireAdmin(req, res, next) {
   } catch (error) {
     next(error);
   }
+}
+
+function safeSecretEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left));
+  const rightBuffer = Buffer.from(String(right));
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function buildCorsOrigin() {
