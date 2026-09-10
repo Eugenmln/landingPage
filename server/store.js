@@ -35,6 +35,9 @@ export async function initializeStore() {
   pool = new Pool({
     connectionString: databaseUrl,
     ssl: process.env.DB_SSL === "true" ? { rejectUnauthorized: false } : undefined,
+    max: Number(process.env.DB_POOL_MAX || 5),
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
   });
 
   await pool.query(`
@@ -55,6 +58,7 @@ export async function initializeStore() {
       title TEXT NOT NULL,
       pieces TEXT NOT NULL DEFAULT '',
       image TEXT NOT NULL DEFAULT '',
+      product_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -67,12 +71,16 @@ export async function initializeStore() {
     );
   `);
 
+  await pool.query(`ALTER TABLE outfits ADD COLUMN IF NOT EXISTS product_ids JSONB NOT NULL DEFAULT '[]'::jsonb`);
+
   await pool.query(
     `INSERT INTO store_settings (id, phone, instagram, admin_pin)
      VALUES (1, $1, $2, $3)
      ON CONFLICT (id) DO NOTHING`,
     [defaultSettings.phone, defaultSettings.instagram, defaultSettings.adminPin],
   );
+
+  await pool.query("SELECT 1");
 }
 
 export function usingPostgres() {
@@ -86,7 +94,7 @@ export async function getStore() {
 
   const [productsResult, outfitsResult, settingsResult] = await Promise.all([
     pool.query(`SELECT id, name, category, price, sizes, badge, image FROM products ORDER BY created_at DESC`),
-    pool.query(`SELECT id, title, pieces, image FROM outfits ORDER BY created_at DESC`),
+    pool.query(`SELECT id, title, pieces, image, product_ids FROM outfits ORDER BY created_at DESC`),
     pool.query(`SELECT phone, instagram, admin_pin FROM store_settings WHERE id = 1`),
   ]);
 
@@ -94,7 +102,7 @@ export async function getStore() {
 
   return {
     products: productsResult.rows.map(mapProductRow),
-    outfits: outfitsResult.rows,
+    outfits: outfitsResult.rows.map(mapOutfitRow),
     settings: {
       phone: settingsRow?.phone || defaultSettings.phone,
       instagram: settingsRow?.instagram || defaultSettings.instagram,
@@ -129,15 +137,51 @@ export async function upsertProduct(product) {
   return mapProductRow(result.rows[0]);
 }
 
+export async function productExists(id) {
+  if (!pool) {
+    return readJsonStore().products.some((item) => item.id === id);
+  }
+  const result = await pool.query(`SELECT 1 FROM products WHERE id = $1`, [id]);
+  return result.rowCount > 0;
+}
+
 export async function removeProduct(id) {
   if (!pool) {
     const store = readJsonStore();
+    const before = store.products.length;
     store.products = store.products.filter((item) => item.id !== id);
+    store.outfits = store.outfits.map((outfit) => ({
+      ...outfit,
+      productIds: normalizeIds(outfit.productIds).filter((productId) => productId !== id),
+    }));
     writeJsonStore(store);
-    return;
+    return store.products.length !== before;
   }
 
-  await pool.query(`DELETE FROM products WHERE id = $1`, [id]);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const deleted = await client.query(`DELETE FROM products WHERE id = $1 RETURNING id`, [id]);
+    if (deleted.rowCount > 0) {
+      await client.query(
+        `UPDATE outfits
+         SET product_ids = COALESCE((
+           SELECT jsonb_agg(value)
+           FROM jsonb_array_elements_text(product_ids) value
+           WHERE value <> $1
+         ), '[]'::jsonb), updated_at = NOW()
+         WHERE product_ids ? $1`,
+        [id],
+      );
+    }
+    await client.query("COMMIT");
+    return deleted.rowCount > 0;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function upsertOutfit(outfit) {
@@ -149,29 +193,40 @@ export async function upsertOutfit(outfit) {
   }
 
   const result = await pool.query(
-    `INSERT INTO outfits (id, title, pieces, image)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO outfits (id, title, pieces, image, product_ids)
+     VALUES ($1, $2, $3, $4, $5::jsonb)
      ON CONFLICT (id) DO UPDATE SET
        title = EXCLUDED.title,
        pieces = EXCLUDED.pieces,
        image = EXCLUDED.image,
+       product_ids = EXCLUDED.product_ids,
        updated_at = NOW()
-     RETURNING id, title, pieces, image`,
-    [outfit.id, outfit.title, outfit.pieces, outfit.image],
+     RETURNING id, title, pieces, image, product_ids`,
+    [outfit.id, outfit.title, outfit.pieces, outfit.image, JSON.stringify(outfit.productIds)],
   );
 
-  return result.rows[0];
+  return mapOutfitRow(result.rows[0]);
+}
+
+export async function outfitExists(id) {
+  if (!pool) {
+    return readJsonStore().outfits.some((item) => item.id === id);
+  }
+  const result = await pool.query(`SELECT 1 FROM outfits WHERE id = $1`, [id]);
+  return result.rowCount > 0;
 }
 
 export async function removeOutfit(id) {
   if (!pool) {
     const store = readJsonStore();
+    const before = store.outfits.length;
     store.outfits = store.outfits.filter((item) => item.id !== id);
     writeJsonStore(store);
-    return;
+    return store.outfits.length !== before;
   }
 
-  await pool.query(`DELETE FROM outfits WHERE id = $1`, [id]);
+  const result = await pool.query(`DELETE FROM outfits WHERE id = $1 RETURNING id`, [id]);
+  return result.rowCount > 0;
 }
 
 export async function updateSettings(settings) {
@@ -197,12 +252,26 @@ export async function updateSettings(settings) {
   };
 }
 
+export async function closeStore() {
+  if (pool) {
+    await pool.end();
+    pool = null;
+  }
+}
+
 function readJsonStore() {
   if (!existsSync(jsonPath)) {
     writeJsonStore(emptyStore);
   }
 
-  return JSON.parse(readFileSync(jsonPath, "utf8"));
+  const parsed = JSON.parse(readFileSync(jsonPath, "utf8"));
+  return {
+    products: Array.isArray(parsed.products) ? parsed.products : [],
+    outfits: Array.isArray(parsed.outfits)
+      ? parsed.outfits.map((outfit) => ({ ...outfit, productIds: normalizeIds(outfit.productIds) }))
+      : [],
+    settings: { ...defaultSettings, ...(parsed.settings || {}) },
+  };
 }
 
 function writeJsonStore(store) {
@@ -216,4 +285,18 @@ function mapProductRow(row) {
     price: Number(row.price),
     sizes: Array.isArray(row.sizes) ? row.sizes : [],
   };
+}
+
+function mapOutfitRow(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    pieces: row.pieces,
+    image: row.image,
+    productIds: normalizeIds(row.product_ids),
+  };
+}
+
+function normalizeIds(value) {
+  return Array.isArray(value) ? value.map(String).filter(Boolean) : [];
 }
