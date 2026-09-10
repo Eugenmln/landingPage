@@ -25,6 +25,10 @@ let pool = null;
 
 export async function initializeStore() {
   if (!databaseUrl) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("DATABASE_URL is required when NODE_ENV=production.");
+    }
+
     mkdirSync(dataDir, { recursive: true });
     if (!existsSync(jsonPath)) {
       writeJsonStore(emptyStore);
@@ -167,7 +171,7 @@ export async function removeProduct(id) {
         `UPDATE outfits
          SET product_ids = COALESCE((
            SELECT jsonb_agg(value)
-           FROM jsonb_array_elements_text(product_ids) value
+           FROM jsonb_array_elements_text(product_ids) AS elem(value)
            WHERE value <> $1
          ), '[]'::jsonb), updated_at = NOW()
          WHERE product_ids ? $1`,
