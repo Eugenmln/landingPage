@@ -1,13 +1,17 @@
 import cors from "cors";
 import express from "express";
-import { randomUUID } from "node:crypto";
+import helmet from "helmet";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
 import {
+  closeStore,
   getStore,
   initializeStore,
+  outfitExists,
+  productExists,
   removeOutfit,
   removeProduct,
   updateSettings,
@@ -15,6 +19,11 @@ import {
   upsertProduct,
   usingPostgres,
 } from "./store.js";
+import {
+  buildUploadMiddleware,
+  persistUploadedImage,
+  usingCloudinary,
+} from "./imageStorage.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -32,38 +41,39 @@ if (isProduction && !process.env.ADMIN_PIN) {
   throw new Error("ADMIN_PIN is required when NODE_ENV=production.");
 }
 
-mkdirSync(uploadDir, { recursive: true });
+if (!usingCloudinary()) {
+  mkdirSync(uploadDir, { recursive: true });
+}
 
-const storage = multer.diskStorage({
-  destination: uploadDir,
-  filename: (_req, file, cb) => {
-    const ext = safeImageExtension(file);
-    cb(null, `${Date.now()}-${randomUUID()}${ext}`);
-  },
-});
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 8 * 1024 * 1024, files: 1 },
-  fileFilter: (_req, file, cb) => {
-    if (!file.mimetype.startsWith("image/")) {
-      cb(new Error("Solo se permiten archivos de imagen."));
-      return;
-    }
-    cb(null, true);
-  },
-});
-
+const upload = buildUploadMiddleware(uploadDir);
 const app = express();
 
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  contentSecurityPolicy: false,
+}));
 app.use(cors({ origin: buildCorsOrigin() }));
 app.use(express.json({ limit: "1mb" }));
-app.use("/uploads", express.static(uploadDir, { fallthrough: false, maxAge: isProduction ? "7d" : 0 }));
 
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, storage: usingPostgres() ? "postgres" : "json" });
-});
+if (!usingCloudinary()) {
+  app.use("/uploads", express.static(uploadDir, {
+    fallthrough: false,
+    maxAge: isProduction ? "7d" : 0,
+  }));
+}
+
+app.get("/api/health", asyncHandler(async (_req, res) => {
+  const store = await getStore();
+  res.json({
+    ok: true,
+    database: usingPostgres() ? "postgres" : "json",
+    images: usingCloudinary() ? "cloudinary" : "local",
+    products: store.products.length,
+    outfits: store.outfits.length,
+  });
+}));
 
 app.get("/api/store", asyncHandler(async (_req, res) => {
   const store = await getStore();
@@ -85,6 +95,9 @@ app.post("/api/products", requireAdmin, asyncHandler(async (req, res) => {
 }));
 
 app.put("/api/products/:id", requireAdmin, asyncHandler(async (req, res) => {
+  if (!(await productExists(req.params.id))) {
+    throw notFound("La prenda no existe.");
+  }
   const product = normalizeProduct({ ...req.body, id: req.params.id });
   validateProduct(product);
   const saved = await upsertProduct(product);
@@ -92,26 +105,37 @@ app.put("/api/products/:id", requireAdmin, asyncHandler(async (req, res) => {
 }));
 
 app.delete("/api/products/:id", requireAdmin, asyncHandler(async (req, res) => {
-  await removeProduct(req.params.id);
+  const deleted = await removeProduct(req.params.id);
+  if (!deleted) {
+    throw notFound("La prenda no existe.");
+  }
   res.json({ ok: true });
 }));
 
 app.post("/api/outfits", requireAdmin, asyncHandler(async (req, res) => {
   const outfit = normalizeOutfit(req.body);
   validateOutfit(outfit);
+  await validateOutfitProducts(outfit.productIds);
   const saved = await upsertOutfit(outfit);
   res.status(201).json(saved);
 }));
 
 app.put("/api/outfits/:id", requireAdmin, asyncHandler(async (req, res) => {
+  if (!(await outfitExists(req.params.id))) {
+    throw notFound("El outfit no existe.");
+  }
   const outfit = normalizeOutfit({ ...req.body, id: req.params.id });
   validateOutfit(outfit);
+  await validateOutfitProducts(outfit.productIds);
   const saved = await upsertOutfit(outfit);
   res.json(saved);
 }));
 
 app.delete("/api/outfits/:id", requireAdmin, asyncHandler(async (req, res) => {
-  await removeOutfit(req.params.id);
+  const deleted = await removeOutfit(req.params.id);
+  if (!deleted) {
+    throw notFound("El outfit no existe.");
+  }
   res.json({ ok: true });
 }));
 
@@ -123,8 +147,11 @@ app.put("/api/settings", requireAdmin, asyncHandler(async (req, res) => {
     adminPin: process.env.ADMIN_PIN || String(req.body.adminPin || current.settings.adminPin),
   };
 
-  if (!settings.phone) {
-    return res.status(400).json({ message: "Ingresá un número de WhatsApp válido." });
+  if (!settings.phone || settings.phone.length < 10 || settings.phone.length > 15) {
+    throw badRequest("Ingresá un número de WhatsApp válido con código de país y área.");
+  }
+  if (!settings.instagram) {
+    throw badRequest("Ingresá el usuario de Instagram.");
   }
 
   const saved = await updateSettings(settings);
@@ -132,22 +159,30 @@ app.put("/api/settings", requireAdmin, asyncHandler(async (req, res) => {
 }));
 
 app.post("/api/uploads", requireAdmin, (req, res, next) => {
-  upload.single("image")(req, res, (error) => {
+  upload.single("image")(req, res, async (error) => {
     if (error) {
       next(error);
       return;
     }
 
-    if (!req.file) {
-      res.status(400).json({ message: "Subí una imagen válida." });
-      return;
-    }
+    try {
+      if (!req.file) {
+        throw badRequest("Subí una imagen válida.");
+      }
 
-    res.status(201).json({ url: `/uploads/${req.file.filename}` });
+      const uploaded = await persistUploadedImage(req.file);
+      res.status(201).json(uploaded);
+    } catch (uploadError) {
+      next(uploadError);
+    }
   });
 });
 
-app.use(express.static(path.join(root, "dist")));
+app.use(express.static(path.join(root, "dist"), {
+  maxAge: isProduction ? "1h" : 0,
+  index: false,
+}));
+
 app.get(/.*/, (_req, res, next) => {
   res.sendFile(path.join(root, "dist", "index.html"), (error) => {
     if (error) next(error);
@@ -156,20 +191,45 @@ app.get(/.*/, (_req, res, next) => {
 
 app.use((error, _req, res, _next) => {
   console.error(error);
+
   if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({ message: "La imagen no puede superar los 8 MB." });
   }
-  if (error?.message === "Solo se permiten archivos de imagen.") {
+
+  if (error?.message?.startsWith("Solo se permiten imágenes")) {
     return res.status(400).json({ message: error.message });
   }
-  res.status(error.status || 500).json({ message: error.status ? error.message : "Ocurrió un error en el servidor." });
+
+  if (error?.message === "Origen no permitido por CORS.") {
+    return res.status(403).json({ message: error.message });
+  }
+
+  const status = Number(error.status) || 500;
+  res.status(status).json({
+    message: status >= 500 ? "Ocurrió un error en el servidor." : error.message,
+  });
 });
 
 await initializeStore();
 
-app.listen(port, () => {
-  console.log(`Kenza API running on http://localhost:${port} (${usingPostgres() ? "PostgreSQL" : "JSON local"})`);
+const server = app.listen(port, () => {
+  console.log(
+    `Kenza API running on http://localhost:${port} (${usingPostgres() ? "PostgreSQL" : "JSON local"}, ${usingCloudinary() ? "Cloudinary" : "local images"})`,
+  );
 });
+
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, async () => {
+    console.log(`${signal} received. Closing server...`);
+    server.close(async () => {
+      try {
+        await closeStore();
+      } finally {
+        process.exit(0);
+      }
+    });
+  });
+}
 
 function asyncHandler(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -205,28 +265,20 @@ function buildCorsOrigin() {
   };
 }
 
-function safeImageExtension(file) {
-  const mimeExtensions = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "image/gif": ".gif",
-  };
-  return mimeExtensions[file.mimetype] || ".img";
-}
-
 function normalizeProduct(input) {
   return {
     id: input.id || randomUUID(),
     name: String(input.name || "").trim(),
     category: String(input.category || "Remeras").trim(),
-    price: Number(input.price || 0),
+    price: Number(input.price),
     sizes: Array.isArray(input.sizes)
-      ? input.sizes.map((size) => String(size).trim()).filter(Boolean)
-      : String(input.sizes || "Único")
-          .split(",")
-          .map((size) => size.trim())
-          .filter(Boolean),
+      ? [...new Set(input.sizes.map((size) => String(size).trim()).filter(Boolean))]
+      : [...new Set(
+          String(input.sizes || "Único")
+            .split(",")
+            .map((size) => size.trim())
+            .filter(Boolean),
+        )],
     badge: String(input.badge || "").trim(),
     image: String(input.image || "").trim(),
   };
@@ -238,32 +290,74 @@ function normalizeOutfit(input) {
     title: String(input.title || "").trim(),
     pieces: String(input.pieces || "").trim(),
     image: String(input.image || "").trim(),
+    productIds: Array.isArray(input.productIds)
+      ? [...new Set(input.productIds.map(String).map((id) => id.trim()).filter(Boolean))]
+      : [],
   };
 }
 
 function validateProduct(product) {
-  if (!product.name) {
-    throw badRequest("Ingresá el nombre de la prenda.");
+  if (!product.name || product.name.length > 120) {
+    throw badRequest("Ingresá un nombre de prenda de hasta 120 caracteres.");
   }
-  if (!Number.isFinite(product.price) || product.price < 0) {
+  if (!Number.isFinite(product.price) || product.price < 0 || product.price > 999999999) {
     throw badRequest("Ingresá un precio válido.");
   }
-  if (!product.category) {
-    throw badRequest("Seleccioná una categoría.");
+  if (!product.category || product.category.length > 60) {
+    throw badRequest("Seleccioná una categoría válida.");
+  }
+  if (product.sizes.length === 0 || product.sizes.length > 20) {
+    throw badRequest("Ingresá entre 1 y 20 talles.");
+  }
+  if (product.image && !isValidImageReference(product.image)) {
+    throw badRequest("La imagen de la prenda no es válida.");
   }
 }
 
 function validateOutfit(outfit) {
-  if (!outfit.title) {
-    throw badRequest("Ingresá un nombre para el outfit.");
+  if (!outfit.title || outfit.title.length > 120) {
+    throw badRequest("Ingresá un nombre para el outfit de hasta 120 caracteres.");
   }
-  if (!outfit.image) {
-    throw badRequest("Subí una imagen para el outfit.");
+  if (outfit.pieces.length > 500) {
+    throw badRequest("La descripción del outfit no puede superar 500 caracteres.");
+  }
+  if (!outfit.image || !isValidImageReference(outfit.image)) {
+    throw badRequest("Subí una imagen válida para el outfit.");
+  }
+  if (outfit.productIds.length > 30) {
+    throw badRequest("Un outfit no puede vincular más de 30 prendas.");
+  }
+}
+
+async function validateOutfitProducts(ids) {
+  for (const id of ids) {
+    if (!(await productExists(id))) {
+      throw badRequest(`La prenda vinculada ${id} no existe.`);
+    }
+  }
+}
+
+function isValidImageReference(value) {
+  if (value.startsWith("/uploads/")) {
+    return true;
+  }
+
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || (!isProduction && url.protocol === "http:");
+  } catch {
+    return value.startsWith("/");
   }
 }
 
 function badRequest(message) {
   const error = new Error(message);
   error.status = 400;
+  return error;
+}
+
+function notFound(message) {
+  const error = new Error(message);
+  error.status = 404;
   return error;
 }
