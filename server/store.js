@@ -12,7 +12,6 @@ const databaseUrl = process.env.DATABASE_URL?.trim();
 const defaultSettings = {
   phone: "5493764000000",
   instagram: "kenza.posadas",
-  adminPin: process.env.ADMIN_PIN || "1234",
 };
 
 const emptyStore = {
@@ -70,18 +69,18 @@ export async function initializeStore() {
     CREATE TABLE IF NOT EXISTS store_settings (
       id SMALLINT PRIMARY KEY CHECK (id = 1),
       phone TEXT NOT NULL,
-      instagram TEXT NOT NULL,
-      admin_pin TEXT NOT NULL
+      instagram TEXT NOT NULL
     );
   `);
 
   await pool.query(`ALTER TABLE outfits ADD COLUMN IF NOT EXISTS product_ids JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE store_settings DROP COLUMN IF EXISTS admin_pin`);
 
   await pool.query(
-    `INSERT INTO store_settings (id, phone, instagram, admin_pin)
-     VALUES (1, $1, $2, $3)
+    `INSERT INTO store_settings (id, phone, instagram)
+     VALUES (1, $1, $2)
      ON CONFLICT (id) DO NOTHING`,
-    [defaultSettings.phone, defaultSettings.instagram, defaultSettings.adminPin],
+    [defaultSettings.phone, defaultSettings.instagram],
   );
 
   await pool.query("SELECT 1");
@@ -99,7 +98,7 @@ export async function getStore() {
   const [productsResult, outfitsResult, settingsResult] = await Promise.all([
     pool.query(`SELECT id, name, category, price, sizes, badge, image FROM products ORDER BY created_at DESC`),
     pool.query(`SELECT id, title, pieces, image, product_ids FROM outfits ORDER BY created_at DESC`),
-    pool.query(`SELECT phone, instagram, admin_pin FROM store_settings WHERE id = 1`),
+    pool.query(`SELECT phone, instagram FROM store_settings WHERE id = 1`),
   ]);
 
   const settingsRow = settingsResult.rows[0];
@@ -110,7 +109,6 @@ export async function getStore() {
     settings: {
       phone: settingsRow?.phone || defaultSettings.phone,
       instagram: settingsRow?.instagram || defaultSettings.instagram,
-      adminPin: settingsRow?.admin_pin || defaultSettings.adminPin,
     },
   };
 }
@@ -243,17 +241,13 @@ export async function updateSettings(settings) {
 
   const result = await pool.query(
     `UPDATE store_settings
-     SET phone = $1, instagram = $2, admin_pin = $3
+     SET phone = $1, instagram = $2
      WHERE id = 1
-     RETURNING phone, instagram, admin_pin`,
-    [settings.phone, settings.instagram, settings.adminPin],
+     RETURNING phone, instagram`,
+    [settings.phone, settings.instagram],
   );
 
-  return {
-    phone: result.rows[0].phone,
-    instagram: result.rows[0].instagram,
-    adminPin: result.rows[0].admin_pin,
-  };
+  return result.rows[0];
 }
 
 export async function closeStore() {
