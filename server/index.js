@@ -2,7 +2,7 @@ import cors from "cors";
 import express from "express";
 import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
-import { timingSafeEqual, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,13 @@ import {
   persistUploadedImage,
   usingCloudinary,
 } from "./imageStorage.js";
+import {
+  authenticateAdminRequest,
+  clearAdminSessionCookie,
+  initializeAuth,
+  loginAdmin,
+  setAdminSessionCookie,
+} from "./auth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -38,10 +45,6 @@ const configuredOrigins = String(process.env.CORS_ORIGIN || "")
   .map((origin) => origin.trim())
   .filter(Boolean);
 
-if (isProduction && !process.env.ADMIN_PIN) {
-  throw new Error("ADMIN_PIN is required when NODE_ENV=production.");
-}
-
 if (!usingCloudinary()) {
   mkdirSync(uploadDir, { recursive: true });
 }
@@ -54,6 +57,14 @@ const adminLimiter = rateLimit({
   legacyHeaders: false,
   message: { message: "Demasiados intentos. Esperá unos minutos y volvé a intentar." },
 });
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 8,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: { message: "Demasiados intentos de acceso. Esperá unos minutos y volvé a intentar." },
+});
 
 const app = express();
 
@@ -63,7 +74,7 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: false,
 }));
-app.use(cors({ origin: buildCorsOrigin() }));
+app.use(cors({ origin: buildCorsOrigin(), credentials: true }));
 app.use(express.json({ limit: "1mb" }));
 
 if (!usingCloudinary()) {
@@ -95,6 +106,29 @@ app.get("/api/store", asyncHandler(async (_req, res) => {
     },
   });
 }));
+
+app.post("/api/admin/login", loginLimiter, asyncHandler(async (req, res) => {
+  const session = await loginAdmin(req.body.email, req.body.password);
+  if (!session) {
+    return res.status(401).json({ message: "Email o contraseña incorrectos." });
+  }
+
+  setAdminSessionCookie(res, session.token);
+  res.json({ authenticated: true, email: session.email });
+}));
+
+app.get("/api/admin/session", (req, res) => {
+  const admin = authenticateAdminRequest(req);
+  if (!admin) {
+    return res.status(401).json({ authenticated: false });
+  }
+  res.json({ authenticated: true, email: admin.email });
+});
+
+app.post("/api/admin/logout", (req, res) => {
+  clearAdminSessionCookie(res);
+  res.json({ ok: true });
+});
 
 app.post("/api/products", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
   const product = normalizeProduct(req.body);
@@ -153,7 +187,6 @@ app.put("/api/settings", adminLimiter, requireAdmin, asyncHandler(async (req, re
   const settings = {
     phone: String(req.body.phone || current.settings.phone).replace(/[^\d]/g, ""),
     instagram: String(req.body.instagram || current.settings.instagram).replace(/^@/, "").trim(),
-    adminPin: process.env.ADMIN_PIN || String(req.body.adminPin || current.settings.adminPin),
   };
 
   if (!settings.phone || settings.phone.length < 10 || settings.phone.length > 15) {
@@ -224,6 +257,7 @@ app.use((error, _req, res, _next) => {
 });
 
 await initializeStore();
+await initializeAuth();
 
 const server = app.listen(port, () => {
   console.log(
@@ -248,26 +282,13 @@ function asyncHandler(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 
-async function requireAdmin(req, res, next) {
-  try {
-    const store = await getStore();
-    const expected = process.env.ADMIN_PIN || store.settings.adminPin;
-    const supplied = req.header("x-admin-pin");
-
-    if (!supplied || !safeSecretEqual(supplied, expected)) {
-      return res.status(401).json({ message: "Clave de administrador incorrecta." });
-    }
-
-    next();
-  } catch (error) {
-    next(error);
+function requireAdmin(req, res, next) {
+  const admin = authenticateAdminRequest(req);
+  if (!admin) {
+    return res.status(401).json({ message: "Necesitás iniciar sesión como administrador." });
   }
-}
-
-function safeSecretEqual(left, right) {
-  const leftBuffer = Buffer.from(String(left));
-  const rightBuffer = Buffer.from(String(right));
-  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+  req.admin = admin;
+  next();
 }
 
 function buildCorsOrigin() {
