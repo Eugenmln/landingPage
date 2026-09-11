@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: kenze-dev-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: kenze
+      POSTGRES_USER: kenze
+      POSTGRES_PASSWORD: kenze_dev_password
+    ports:
+      - "5434:5432"
+    volumes:
+      - kenze_dev_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kenze -d kenze"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  kenze_dev_postgres_data:

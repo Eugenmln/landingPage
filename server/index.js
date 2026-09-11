@@ -1,78 +1,102 @@
 import cors from "cors";
 import express from "express";
+import { rateLimit } from "express-rate-limit";
+import helmet from "helmet";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
-import { starterOutfits, starterProducts } from "../src/data.js";
+import {
+  closeStore,
+  getStore,
+  initializeStore,
+  outfitExists,
+  productExists,
+  removeOutfit,
+  removeProduct,
+  updateSettings,
+  upsertOutfit,
+  upsertProduct,
+  usingPostgres,
+} from "./store.js";
+import {
+  buildUploadMiddleware,
+  persistUploadedImage,
+  usingCloudinary,
+} from "./imageStorage.js";
+import {
+  authenticateAdminRequest,
+  clearAdminSessionCookie,
+  initializeAuth,
+  loginAdmin,
+  setAdminSessionCookie,
+} from "./auth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
-const dataDir = path.join(__dirname, "data");
-const uploadDir = path.join(root, "public", "uploads");
-const dbPath = path.join(dataDir, "store.json");
+const uploadDir = process.env.UPLOAD_DIR
+  ? path.resolve(process.env.UPLOAD_DIR)
+  : path.join(root, "public", "uploads");
 const port = Number(process.env.PORT || 4000);
+const isProduction = process.env.NODE_ENV === "production";
+const configuredOrigins = String(process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
-mkdirSync(dataDir, { recursive: true });
-mkdirSync(uploadDir, { recursive: true });
-
-const initialStore = {
-  products: starterProducts,
-  outfits: starterOutfits,
-  settings: {
-    phone: "5493764000000",
-    instagram: "kenza.posadas",
-    adminPin: process.env.ADMIN_PIN || "1234",
-  },
-};
-
-function readStore() {
-  if (!existsSync(dbPath)) {
-    writeStore(initialStore);
-    return initialStore;
-  }
-
-  return JSON.parse(readFileSync(dbPath, "utf8"));
+if (!usingCloudinary()) {
+  mkdirSync(uploadDir, { recursive: true });
 }
 
-function writeStore(store) {
-  writeFileSync(dbPath, JSON.stringify(store, null, 2));
-}
-
-function requireAdmin(req, res, next) {
-  const store = readStore();
-  const expected = process.env.ADMIN_PIN || store.settings.adminPin;
-  if (req.header("x-admin-pin") !== expected) {
-    return res.status(401).json({ message: "Clave de administrador incorrecta." });
-  }
-
-  next();
-}
-
-const storage = multer.diskStorage({
-  destination: uploadDir,
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || ".jpg";
-    cb(null, `${Date.now()}-${randomUUID()}${ext}`);
-  },
+const upload = buildUploadMiddleware(uploadDir);
+const adminLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 60,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { message: "Demasiados intentos. Esperá unos minutos y volvé a intentar." },
 });
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 8 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    cb(null, file.mimetype.startsWith("image/"));
-  },
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 8,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: { message: "Demasiados intentos de acceso. Esperá unos minutos y volvé a intentar." },
 });
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
-app.use("/uploads", express.static(uploadDir));
 
-app.get("/api/store", (_req, res) => {
-  const store = readStore();
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  contentSecurityPolicy: false,
+}));
+app.use(cors({ origin: buildCorsOrigin(), credentials: true }));
+app.use(express.json({ limit: "1mb" }));
+
+if (!usingCloudinary()) {
+  app.use("/uploads", express.static(uploadDir, {
+    fallthrough: false,
+    maxAge: isProduction ? "7d" : 0,
+  }));
+}
+
+app.get("/api/health", asyncHandler(async (_req, res) => {
+  const store = await getStore();
+  res.json({
+    ok: true,
+    database: usingPostgres() ? "postgres" : "json",
+    images: usingCloudinary() ? "cloudinary" : "local",
+    products: store.products.length,
+    outfits: store.outfits.length,
+  });
+}));
+
+app.get("/api/store", asyncHandler(async (_req, res) => {
+  const store = await getStore();
   res.json({
     products: store.products,
     outfits: store.outfits,
@@ -81,98 +105,220 @@ app.get("/api/store", (_req, res) => {
       instagram: store.settings.instagram,
     },
   });
+}));
+
+app.post("/api/admin/login", loginLimiter, asyncHandler(async (req, res) => {
+  const session = await loginAdmin(req.body.email, req.body.password);
+  if (!session) {
+    return res.status(401).json({ message: "Email o contraseña incorrectos." });
+  }
+
+  setAdminSessionCookie(res, session.token);
+  res.json({ authenticated: true, email: session.email });
+}));
+
+app.get("/api/admin/session", (req, res) => {
+  const admin = authenticateAdminRequest(req);
+  if (!admin) {
+    return res.status(401).json({ authenticated: false });
+  }
+  res.json({ authenticated: true, email: admin.email });
 });
 
-app.post("/api/products", requireAdmin, (req, res) => {
-  const store = readStore();
+app.post("/api/admin/logout", (req, res) => {
+  clearAdminSessionCookie(res);
+  res.json({ ok: true });
+});
+
+app.post("/api/products", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
   const product = normalizeProduct(req.body);
-  store.products = [product, ...store.products];
-  writeStore(store);
-  res.status(201).json(product);
-});
+  validateProduct(product);
+  const saved = await upsertProduct(product);
+  res.status(201).json(saved);
+}));
 
-app.put("/api/products/:id", requireAdmin, (req, res) => {
-  const store = readStore();
+app.put("/api/products/:id", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
+  if (!(await productExists(req.params.id))) {
+    throw notFound("La prenda no existe.");
+  }
   const product = normalizeProduct({ ...req.body, id: req.params.id });
-  store.products = store.products.map((item) => (item.id === req.params.id ? product : item));
-  writeStore(store);
-  res.json(product);
-});
+  validateProduct(product);
+  const saved = await upsertProduct(product);
+  res.json(saved);
+}));
 
-app.delete("/api/products/:id", requireAdmin, (req, res) => {
-  const store = readStore();
-  store.products = store.products.filter((item) => item.id !== req.params.id);
-  writeStore(store);
+app.delete("/api/products/:id", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
+  const deleted = await removeProduct(req.params.id);
+  if (!deleted) {
+    throw notFound("La prenda no existe.");
+  }
   res.json({ ok: true });
-});
+}));
 
-app.post("/api/outfits", requireAdmin, (req, res) => {
-  const store = readStore();
+app.post("/api/outfits", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
   const outfit = normalizeOutfit(req.body);
-  store.outfits = [outfit, ...store.outfits];
-  writeStore(store);
-  res.status(201).json(outfit);
-});
+  validateOutfit(outfit);
+  await validateOutfitProducts(outfit.productIds);
+  const saved = await upsertOutfit(outfit);
+  res.status(201).json(saved);
+}));
 
-app.put("/api/outfits/:id", requireAdmin, (req, res) => {
-  const store = readStore();
+app.put("/api/outfits/:id", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
+  if (!(await outfitExists(req.params.id))) {
+    throw notFound("El outfit no existe.");
+  }
   const outfit = normalizeOutfit({ ...req.body, id: req.params.id });
-  store.outfits = store.outfits.map((item) => (item.id === req.params.id ? outfit : item));
-  writeStore(store);
-  res.json(outfit);
-});
+  validateOutfit(outfit);
+  await validateOutfitProducts(outfit.productIds);
+  const saved = await upsertOutfit(outfit);
+  res.json(saved);
+}));
 
-app.delete("/api/outfits/:id", requireAdmin, (req, res) => {
-  const store = readStore();
-  store.outfits = store.outfits.filter((item) => item.id !== req.params.id);
-  writeStore(store);
+app.delete("/api/outfits/:id", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
+  const deleted = await removeOutfit(req.params.id);
+  if (!deleted) {
+    throw notFound("El outfit no existe.");
+  }
   res.json({ ok: true });
-});
+}));
 
-app.put("/api/settings", requireAdmin, (req, res) => {
-  const store = readStore();
-  store.settings = {
-    ...store.settings,
-    phone: String(req.body.phone || store.settings.phone).replace(/[^\d]/g, ""),
-    instagram: String(req.body.instagram || store.settings.instagram).replace("@", ""),
-    adminPin: String(req.body.adminPin || store.settings.adminPin),
+app.put("/api/settings", adminLimiter, requireAdmin, asyncHandler(async (req, res) => {
+  const current = await getStore();
+  const settings = {
+    phone: String(req.body.phone || current.settings.phone).replace(/[^\d]/g, ""),
+    instagram: String(req.body.instagram || current.settings.instagram).replace(/^@/, "").trim(),
   };
-  writeStore(store);
-  res.json({
-    phone: store.settings.phone,
-    instagram: store.settings.instagram,
+
+  if (!settings.phone || settings.phone.length < 10 || settings.phone.length > 15) {
+    throw badRequest("Ingresá un número de WhatsApp válido con código de país y área.");
+  }
+  if (!settings.instagram) {
+    throw badRequest("Ingresá el usuario de Instagram.");
+  }
+
+  const saved = await updateSettings(settings);
+  res.json({ phone: saved.phone, instagram: saved.instagram });
+}));
+
+app.post("/api/uploads", adminLimiter, requireAdmin, (req, res, next) => {
+  upload.single("image")(req, res, async (error) => {
+    if (error) {
+      next(error);
+      return;
+    }
+
+    try {
+      if (!req.file) {
+        throw badRequest("Subí una imagen válida.");
+      }
+
+      const uploaded = await persistUploadedImage(req.file);
+      res.status(201).json(uploaded);
+    } catch (uploadError) {
+      next(uploadError);
+    }
   });
 });
 
-app.post("/api/uploads", requireAdmin, upload.single("image"), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ message: "Subí una imagen válida." });
+app.use("/api", (_req, res) => {
+  res.status(404).json({ message: "Endpoint no encontrado." });
+});
+
+app.use(express.static(path.join(root, "dist"), {
+  maxAge: isProduction ? "1h" : 0,
+  index: false,
+}));
+
+app.get(/.*/, (_req, res, next) => {
+  res.sendFile(path.join(root, "dist", "index.html"), (error) => {
+    if (error) next(error);
+  });
+});
+
+app.use((error, _req, res, _next) => {
+  console.error(error);
+
+  if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+    return res.status(413).json({ message: "La imagen no puede superar los 8 MB." });
   }
 
-  res.status(201).json({ url: `/uploads/${req.file.filename}` });
+  if (error?.message?.startsWith("Solo se permiten imágenes")) {
+    return res.status(400).json({ message: error.message });
+  }
+
+  if (error?.message === "Origen no permitido por CORS.") {
+    return res.status(403).json({ message: error.message });
+  }
+
+  const status = Number(error.status) || 500;
+  res.status(status).json({
+    message: status >= 500 ? "Ocurrió un error en el servidor." : error.message,
+  });
 });
 
-app.use(express.static(path.join(root, "dist")));
-app.get(/.*/, (_req, res) => {
-  res.sendFile(path.join(root, "dist", "index.html"));
+await initializeStore();
+await initializeAuth();
+
+const server = app.listen(port, () => {
+  console.log(
+    `Kenza API running on http://localhost:${port} (${usingPostgres() ? "PostgreSQL" : "JSON local"}, ${usingCloudinary() ? "Cloudinary" : "local images"})`,
+  );
 });
 
-app.listen(port, () => {
-  console.log(`Kenza API running on http://localhost:${port}`);
-});
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, async () => {
+    console.log(`${signal} received. Closing server...`);
+    server.close(async () => {
+      try {
+        await closeStore();
+      } finally {
+        process.exit(0);
+      }
+    });
+  });
+}
+
+function asyncHandler(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
+
+function requireAdmin(req, res, next) {
+  const admin = authenticateAdminRequest(req);
+  if (!admin) {
+    return res.status(401).json({ message: "Necesitás iniciar sesión como administrador." });
+  }
+  req.admin = admin;
+  next();
+}
+
+function buildCorsOrigin() {
+  if (configuredOrigins.length === 0) {
+    return true;
+  }
+
+  return (origin, callback) => {
+    if (!origin || configuredOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error("Origen no permitido por CORS."));
+  };
+}
 
 function normalizeProduct(input) {
   return {
     id: input.id || randomUUID(),
     name: String(input.name || "").trim(),
-    category: String(input.category || "Remeras"),
-    price: Number(input.price || 0),
+    category: String(input.category || "Remeras").trim(),
+    price: Number(input.price),
     sizes: Array.isArray(input.sizes)
-      ? input.sizes
-      : String(input.sizes || "Único")
-          .split(",")
-          .map((size) => size.trim())
-          .filter(Boolean),
+      ? [...new Set(input.sizes.map((size) => String(size).trim()).filter(Boolean))]
+      : [...new Set(
+          String(input.sizes || "Único")
+            .split(",")
+            .map((size) => size.trim())
+            .filter(Boolean),
+        )],
     badge: String(input.badge || "").trim(),
     image: String(input.image || "").trim(),
   };
@@ -184,5 +330,74 @@ function normalizeOutfit(input) {
     title: String(input.title || "").trim(),
     pieces: String(input.pieces || "").trim(),
     image: String(input.image || "").trim(),
+    productIds: Array.isArray(input.productIds)
+      ? [...new Set(input.productIds.map(String).map((id) => id.trim()).filter(Boolean))]
+      : [],
   };
+}
+
+function validateProduct(product) {
+  if (!product.name || product.name.length > 120) {
+    throw badRequest("Ingresá un nombre de prenda de hasta 120 caracteres.");
+  }
+  if (!Number.isFinite(product.price) || product.price < 0 || product.price > 999999999) {
+    throw badRequest("Ingresá un precio válido.");
+  }
+  if (!product.category || product.category.length > 60) {
+    throw badRequest("Seleccioná una categoría válida.");
+  }
+  if (product.sizes.length === 0 || product.sizes.length > 20) {
+    throw badRequest("Ingresá entre 1 y 20 talles.");
+  }
+  if (product.image && !isValidImageReference(product.image)) {
+    throw badRequest("La imagen de la prenda no es válida.");
+  }
+}
+
+function validateOutfit(outfit) {
+  if (!outfit.title || outfit.title.length > 120) {
+    throw badRequest("Ingresá un nombre para el outfit de hasta 120 caracteres.");
+  }
+  if (outfit.pieces.length > 500) {
+    throw badRequest("La descripción del outfit no puede superar 500 caracteres.");
+  }
+  if (!outfit.image || !isValidImageReference(outfit.image)) {
+    throw badRequest("Subí una imagen válida para el outfit.");
+  }
+  if (outfit.productIds.length > 30) {
+    throw badRequest("Un outfit no puede vincular más de 30 prendas.");
+  }
+}
+
+async function validateOutfitProducts(ids) {
+  for (const id of ids) {
+    if (!(await productExists(id))) {
+      throw badRequest(`La prenda vinculada ${id} no existe.`);
+    }
+  }
+}
+
+function isValidImageReference(value) {
+  if (value.startsWith("/uploads/")) {
+    return true;
+  }
+
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || (!isProduction && url.protocol === "http:");
+  } catch {
+    return value.startsWith("/");
+  }
+}
+
+function badRequest(message) {
+  const error = new Error(message);
+  error.status = 400;
+  return error;
+}
+
+function notFound(message) {
+  const error = new Error(message);
+  error.status = 404;
+  return error;
 }
